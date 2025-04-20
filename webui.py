@@ -23,6 +23,7 @@ from browser_use.browser.context import (
     BrowserContextConfig,
     BrowserContextWindowSize,
 )
+from browser_use.agent.views import ActionResult
 from langchain_ollama import ChatOllama
 from playwright.async_api import async_playwright
 from src.utils.agent_state import AgentState
@@ -112,6 +113,64 @@ def resolve_sensitive_env_variables(text):
             result = result.replace(var, env_value)
 
     return result
+
+
+async def upload_file_to_browser(browser_context, file_path, selector, wait_for_navigation=False):
+    """
+    Upload a file to a browser using the provided browser context.
+    
+    Args:
+        browser_context: The browser context to use for uploading
+        file_path: Path to the file to upload
+        selector: CSS selector for the file input element
+        wait_for_navigation: Whether to wait for navigation after upload
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        if not browser_context:
+            logger.error("Browser context is not available")
+            return False
+            
+        page = browser_context.page
+        if not page:
+            logger.error("Page is not available in browser context")
+            return False
+            
+        # Check if file exists
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return False
+            
+        # Set file input value
+        logger.info(f"Uploading file: {file_path} using selector: {selector}")
+        
+        # Handle visible and hidden file inputs
+        try:
+            # Try to find the file input
+            file_input = await page.query_selector(selector)
+            if not file_input:
+                # If selector doesn't match file input directly, try to find type="file" inputs
+                file_input = await page.query_selector('input[type="file"]')
+                
+            if file_input:
+                await file_input.set_input_files(file_path)
+                logger.info(f"File uploaded successfully: {file_path}")
+                
+                if wait_for_navigation:
+                    await page.wait_for_navigation()
+                return True
+            else:
+                logger.error(f"No file input element found with selector: {selector}")
+                return False
+        except Exception as e:
+            logger.error(f"Error uploading file: {str(e)}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error in upload_file_to_browser: {str(e)}")
+        return False
 
 
 async def stop_agent():
@@ -450,7 +509,154 @@ async def run_custom_agent(
         else:
             chrome_path = None
 
-        controller = CustomController()
+        # Extend controller with file upload capabilities
+        class ExtendedCustomController(CustomController):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._browser_context = None
+                
+            def set_browser_context(self, browser_context):
+                """Set the browser context for this controller"""
+                self._browser_context = browser_context
+                return self
+                
+            def _register_custom_actions(self):
+                """Register all custom browser actions"""
+                super()._register_custom_actions()
+                
+                # Register the file upload action using a local function that calls our method
+                @self.registry.action("Upload file to web form")
+                async def upload_file_shadow(label_text: str, file_path: str):
+                    """Upload a file to a web form based on the label text"""
+                    result = await self.upload_file_shadow_impl(label_text, file_path)
+                    if isinstance(result, dict):
+                        # Convert dict to ActionResult
+                        return ActionResult(
+                            extracted_content=f"File upload result: {result.get('success', False)}",
+                            success=result.get('success', False),
+                            error=str(result.get('error', '')) if not result.get('success', False) else None
+                        )
+                    return result
+                
+            async def upload_file_shadow_impl(self, label_text, file_path):
+                """
+                Custom controller method to handle file uploads by label text
+                
+                Args:
+                    label_text: The text label associated with the upload field
+                    file_path: Path to the file to upload
+                
+                Returns:
+                    dict: Result of the operation
+                """
+                try:
+                    logger.info(f"🔍 Starting file upload: {file_path} for label: {label_text}")
+                    
+                    if not os.path.exists(file_path):
+                        logger.error(f"❌ File not found: {file_path}")
+                        return {"success": False, "error": f"File not found: {file_path}"}
+                    
+                    # Log file information
+                    file_size = os.path.getsize(file_path)
+                    logger.info(f"📄 File info: {file_path} - Size: {file_size} bytes")
+                    
+                    # Access the browser context through the class attribute
+                    if not self._browser_context:
+                        logger.error("❌ Browser context not available")
+                        return {"success": False, "error": "Browser context not available"}
+                    
+                    # Access the page from the browser context via playwright context
+                    try:
+                        # Get the Playwright browser instance
+                        playwright_browser = self._browser_context.browser.playwright_browser
+                        
+                        # Get the context and pages
+                        if playwright_browser and playwright_browser.contexts:
+                            playwright_context = playwright_browser.contexts[0]
+                            if playwright_context and playwright_context.pages:
+                                page = playwright_context.pages[0]
+                                # Use the first non-blank page if available
+                                for p in playwright_context.pages:
+                                    if p.url != "about:blank":
+                                        page = p
+                                        break
+                                logger.info(f"🌐 Using page with URL: {page.url}")
+                            else:
+                                logger.error("❌ No pages found in browser context")
+                                return {"success": False, "error": "No pages found in browser context"}
+                        else:
+                            logger.error("❌ No browser contexts available")
+                            return {"success": False, "error": "No browser contexts available"}
+                    except Exception as e:
+                        logger.error(f"❌ Error accessing page: {str(e)}")
+                        return {"success": False, "error": f"Error accessing page: {str(e)}"}
+                    
+                    # Try to get page HTML to help with debugging
+                    try:
+                        html_snippet = await page.evaluate("""
+                            () => {
+                                // Get a preview of the page HTML
+                                const body = document.body;
+                                return body ? body.innerHTML.substring(0, 500) + '...' : 'No body element';
+                            }
+                        """)
+                        logger.debug(f"Page HTML snippet: {html_snippet}")
+                    except Exception as e:
+                        logger.debug(f"Could not get HTML snippet: {str(e)}")
+                    
+                    if "Upload a game video" in label_text:
+                        logger.info("🎬 Handling video upload")
+                        # Direct selector for the video upload element from upload_mp4_div.html
+                        selector = '[class*="drag-drop-view_dragDrop_"]'
+                        try:
+                            # Find the container element
+                            upload_container = await page.query_selector(selector)
+                            if upload_container:
+                                # Find the file input inside the container
+                                file_input = await upload_container.query_selector('input[type="file"]')
+                                if file_input:
+                                    await file_input.set_input_files(file_path)
+                                    logger.info("✅ Video file set successfully")
+                                    return {"success": True, "error": None}
+                                else:
+                                    logger.error("❌ No file input found in video container")
+                            else:
+                                logger.error("❌ Video upload container not found")
+                            
+                            return {"success": False, "error": "Could not find video upload input"}
+                        except Exception as e:
+                            logger.error(f"❌ Error with video upload: {str(e)}")
+                            return {"success": False, "error": f"Error with video upload: {str(e)}"}
+                            
+                    elif "Upload icon" in label_text:
+                        logger.info("🖼️ Handling icon upload")
+                        
+                        # Direct approach for icon upload
+                        icon_container = await page.query_selector('div[class*="h-[56px]"][class*="w-[56px]"]')
+                        if icon_container:
+                            file_input = await icon_container.query_selector('input[type="file"]')
+                            if file_input:
+                                try:
+                                    await file_input.set_input_files(file_path)
+                                    logger.info("✅ Set file on icon input directly")
+                                    return {"success": True, "error": None}
+                                except Exception as e:
+                                    logger.error(f"❌ Error setting file on icon input: {str(e)}")
+                            else:
+                                logger.error("❌ No file input found in icon container")
+                        else:
+                            logger.error("❌ Icon upload container not found")
+                        
+                        return {"success": False, "error": "Could not find icon upload input"}
+                        
+                    else:
+                        logger.error(f"Unknown label: {label_text}")
+                        return {"success": False, "error": f"Unknown label: {label_text}"}
+                except Exception as e:
+                    logger.error(f"Error uploading file: {str(e)}")
+                    return {"success": False, "error": str(e)}
+
+        controller = ExtendedCustomController()
 
         # Initialize global browser if needed
         # if chrome_cdp not empty string nor None
@@ -480,21 +686,62 @@ async def run_custom_agent(
 
         # Create and run agent
         if _global_agent is None:
-            _global_agent = CustomAgent(
-                task=task,
-                add_infos=add_infos,
-                use_vision=use_vision,
-                llm=llm,
-                browser=_global_browser,
-                browser_context=_global_browser_context,
-                controller=controller,
-                system_prompt_class=CustomSystemPrompt,
-                agent_prompt_class=CustomAgentMessagePrompt,
-                max_actions_per_step=max_actions_per_step,
-                tool_calling_method=tool_calling_method,
-                max_input_tokens=max_input_tokens,
-                generate_gif=True
-            )
+            # Define custom tools for the agent
+            custom_tools = {
+                "upload_file_shadow": {
+                    "description": "Upload a file to a web form based on the label text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label_text": {
+                                "type": "string", 
+                                "description": "The label text associated with the file upload field"
+                            },
+                            "file_path": {
+                                "type": "string", 
+                                "description": "Path to the file to upload"
+                            }
+                        },
+                        "required": ["label_text", "file_path"]
+                    }
+                }
+            }
+            
+            # Register the upload_file_shadow action as a method on the controller
+            # This ensures the method is available when the agent calls it
+            controller.set_browser_context(_global_browser_context)
+            
+            # Check if the CustomAgent class accepts custom_tools parameter
+            from inspect import signature
+            custom_agent_params = signature(CustomAgent.__init__).parameters
+            agent_kwargs = {
+                "task": task,
+                "add_infos": add_infos,
+                "use_vision": use_vision,
+                "llm": llm,
+                "browser": _global_browser,
+                "browser_context": _global_browser_context,
+                "controller": controller,
+                "system_prompt_class": CustomSystemPrompt,
+                "agent_prompt_class": CustomAgentMessagePrompt,
+                "max_actions_per_step": max_actions_per_step,
+                "tool_calling_method": tool_calling_method,
+                "max_input_tokens": max_input_tokens,
+                "generate_gif": True
+            }
+            
+            # Try to add custom_tools if the parameter exists
+            try:
+                if 'custom_tools' in custom_agent_params:
+                    agent_kwargs["custom_tools"] = custom_tools
+                
+                _global_agent = CustomAgent(**agent_kwargs)
+            except TypeError as e:
+                # If adding custom_tools fails, try without it
+                logger.warning(f"Error creating CustomAgent with custom_tools: {str(e)}. Trying without custom_tools.")
+                if 'custom_tools' in agent_kwargs:
+                    del agent_kwargs['custom_tools']
+                _global_agent = CustomAgent(**agent_kwargs)
         history = await _global_agent.run(max_steps=max_steps)
 
         history_file = os.path.join(save_agent_history_path, f"{_global_agent.state.agent_id}.json")
@@ -995,6 +1242,24 @@ def create_ui(theme_name="Ocean"):
                     value="go to google.com and type 'OpenAI' click search and give me the first url",
                     info="Describe what you want the agent to do",
                     interactive=True
+                )
+                task_examples = gr.Examples(
+                    [
+                        ["go to google.com and type 'OpenAI' click search and give me the first url"]
+                    ],
+                    task,
+                    label="Example Tasks"
+                )
+                file_upload_info = gr.Markdown(
+                    """
+                    ### File Upload Support
+                    The agent can upload files to the browser. To use this feature, include steps in your task like:
+                    ```
+                    Call the tool upload_file_shadow with:
+                    • label_text = "Upload a game video" (text of the upload label)
+                    • file_path = "/path/to/your/file.mp4" (absolute path to the file)
+                    ```
+                    """,
                 )
                 add_infos = gr.Textbox(
                     label="Additional Information",
